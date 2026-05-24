@@ -1,72 +1,102 @@
-# Authentication setup
+# Configuration and authentication
 
-Both the workflow and the script need credentials that can:
+The workflow and the script share a configuration surface: where the
+marketplace lives, which fork to push to, and how to identify the actor that
+opens pull requests. The workflow reads these from GitHub variables and
+secrets. The script reads the same names from environment variables.
 
-1. Push a branch to your fork of the marketplace
-   (`Mr-RedHat-fb/claude-marketplace`).
-2. Open a pull request upstream
-   (`alfred-intelligence/claude-marketplace`).
+## Configuration model
 
-The workflow uses a stored Personal Access Token. The script uses your local
-`gh` authentication.
+| Name | Type | Scope | Purpose |
+|---|---|---|---|
+| `MARKETPLACE_REPO` | variable | org or repo | Upstream marketplace repo, `owner/repo` |
+| `MARKETPLACE_FORK` | variable | org or repo | Bot's fork of the marketplace, `owner/repo` |
+| `BOT_USERNAME` | variable | org or repo | GitHub login for the bot actor |
+| `BOT_EMAIL` | variable | org or repo | Email recorded on bot commits and PRs |
+| `MARKETPLACE_PAT` | secret | org or repo | PAT owned by the bot account, used for the workflow's push and PR-create |
 
-## Workflow: PAT in a repo secret
+All four variables and the secret can live at the organization level. Repo-level
+values override org-level on name collision. Organization-level is the
+recommended default because rotation and renaming only need to happen once.
 
-### Create the PAT
+## Why a bot account
 
-Either a **classic** or a **fine-grained** PAT works.
+The PR mechanic — push to a fork, open a PR upstream — needs an actor that
+owns a fork and can act unattended. A bot account satisfies both:
+
+- It owns its own fork (`alfred-int-bot/claude-marketplace` in the canonical
+  setup), so cross-owner permission complications don't arise.
+- It has a long-lived PAT scoped to its own repos, kept in the workflows
+  secret store, rotated independently of any human's credentials.
+- Commits and PRs are attributed to the bot, which is the correct signal when
+  automation produced them.
+
+A fine-grained PAT owned by a personal account cannot grant write access on
+org-owned upstream repos that the personal account does not control. A
+bot-owned PAT avoids that limitation by being the resource owner itself.
+
+## Setting variables and secrets
+
+### At organization level (recommended)
+
+1. Open **Settings → Secrets and variables → Actions** in the
+   organization that hosts this `workflows` repo.
+2. Under the **Variables** tab, click **New organization variable** and add
+   `MARKETPLACE_REPO`, `MARKETPLACE_FORK`, `BOT_USERNAME`, `BOT_EMAIL`.
+3. Under the **Secrets** tab, click **New organization secret** and add
+   `MARKETPLACE_PAT`.
+4. For each, restrict access to the repositories that need it.
+
+### At repository level (for overrides)
+
+Same flow but in the workflows repository's own
+**Settings → Secrets and variables → Actions**. A repo-level value takes
+precedence over an org-level value with the same name.
+
+## PAT scopes
+
+Create the PAT while signed in as the bot account.
 
 **Classic** — simplest:
 
 - Scope: `repo` (full).
-- Expiration: pick a date you'll remember to rotate.
+- Expiration: long enough for comfortable rotation, short enough to be hygienic.
 
-**Fine-grained** — preferred for least-privilege:
+**Fine-grained** — possible because the bot owns the fork:
 
-- Resource owner: your account (e.g., `Mr-RedHat-fb`).
-- Repository access: select both `Mr-RedHat-fb/claude-marketplace` and
-  `alfred-intelligence/claude-marketplace`.
+- Resource owner: the bot account.
+- Repository access: the bot-owned fork.
 - Repository permissions:
-  - On the fork: `Contents: Read and write`, `Pull requests: Read and write`.
-  - On the upstream: `Pull requests: Read and write`, `Contents: Read-only`.
+  - `Contents: Read and write`
+  - `Pull requests: Read and write`
 
-### Store the PAT
+For the PR-create call against the upstream repo, the bot account needs to be
+either a collaborator on the upstream or a member of the upstream's
+organization with at least Triage role on the marketplace repo. No additional
+PAT permissions on the upstream are required for opening a PR from the bot's
+own fork.
 
-1. Open
-   <https://github.com/alfred-intelligence/workflows/settings/secrets/actions>.
-2. Click **New repository secret**.
-3. **Name**: `MARKETPLACE_PAT`.
-4. **Value**: paste the PAT.
-5. Click **Add secret**.
+## Pre-flight check
 
-That's the only setup needed for the workflow.
+The workflow's first step verifies that the four variables are set and fails
+with a clear error if any is missing. The script does the equivalent check on
+the env var names.
 
-## Script: `gh` authentication
+## Local environment for the script
 
-The script uses `gh` for the cross-repo operations. Authenticate once on the
-machine you'll run from:
+The script reads `MARKETPLACE_REPO` and `MARKETPLACE_FORK` from the shell
+environment. `MARKETPLACE_REPO` is required. `MARKETPLACE_FORK` defaults to
+the authenticated `gh` user's namespace with the same repo name as
+`MARKETPLACE_REPO`; set it explicitly if you maintain a fork under a different
+name.
 
-```
-gh auth login --hostname github.com --git-protocol https --scopes repo
-```
-
-`gh` stores its token in `~/.config/gh/hosts.yml`. No further setup.
-
-The account `gh` is authenticated as needs the same access as the PAT above
-(push to the fork, PR-create upstream).
+The script does not override the operator's `git config`. Commits and the
+opened PR are attributed to whoever runs the script. Bot-attributed PRs come
+from the workflow.
 
 ## Rotation
 
-PATs expire. When the workflow starts failing with `Bad credentials`,
-regenerate the PAT and update the `MARKETPLACE_PAT` secret. `gh`'s token is
-long-lived and doesn't need rotation under normal use.
-
-## Why not GITHUB_TOKEN?
-
-The default `GITHUB_TOKEN` is scoped to the calling repo
-(`alfred-intelligence/workflows`). It has no write access to either the
-marketplace fork or the upstream marketplace, so it cannot push a branch or
-open a PR across repos. A PAT (or a GitHub App token) is required.
-
-A GitHub App is a reasonable later upgrade if the number of skills or external
-contributors grows enough to justify the setup overhead.
+When the workflow starts failing with `Bad credentials`, regenerate the bot's
+PAT and update `MARKETPLACE_PAT` in whichever scope (org or repo) it lives.
+The script uses the operator's own `gh` token and has no separate rotation
+schedule.
