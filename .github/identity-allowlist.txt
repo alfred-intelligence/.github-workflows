@@ -1,0 +1,12 @@
+# Approved authors/committers/emails for alfred-intelligence public & shared repos.
+# guardrails.sh flags any email, author name, or plugin.json author OUTSIDE this list,
+# so a personal name or private address can't leak into a published repo.
+# One token per line (exact match). Add approved org identities here as needed.
+
+# Maintainer persona
+Mr.RedHat
+mrredhat317@gmail.com
+
+# Automation bot
+alfred-int-bot
+273560732+alfred-int-bot@users.noreply.github.com

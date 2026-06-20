@@ -1,0 +1,33 @@
+name: Guardrails
+
+# Pre-publish hygiene gate. Runs on this repo's own PRs/pushes AND is reusable by
+# any plugin repo (workflow_call). Fails the build on leaked secrets, personal
+# identity (emails/names outside the allowlist), or local /home/<user> paths —
+# the exact mistakes that must never reach a public/shared repo.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  guardrails:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout subject repo
+        uses: actions/checkout@v4
+        with:
+          path: subject
+
+      - name: Checkout guardrail tooling
+        uses: actions/checkout@v4
+        with:
+          repository: alfred-intelligence/workflows
+          path: _tools
+
+      - name: Run guardrails
+        run: bash _tools/scripts/guardrails.sh subject
