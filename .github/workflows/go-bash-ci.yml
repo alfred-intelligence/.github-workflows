@@ -1,0 +1,75 @@
+name: go-bash-ci
+
+# Reusable CI for the alfred-intelligence Go + Bash stack.
+#
+# WHY THIS EXISTS: branch-protection / org-ruleset required-checks and the
+# workflows that produce them kept drifting apart — every repo hand-rolled its
+# own CI with different job names, so the required contexts never matched what
+# actually ran, and every PR blocked. This workflow is the single source of
+# truth for the *generic* gates. Consumer repos call it (see docs/ci.md) and the
+# org ruleset requires exactly the contexts it emits. One definition, no drift.
+#
+# It covers ONLY the generic gates (go-test, go-lint, shell-lint). Repo-specific
+# gates (goreleaser, acceptance matrices, perf benches) stay in the consumer's
+# own workflows — they are not shared and must not be forced into this file.
+
+on:
+  workflow_call:
+    inputs:
+      go-version-file:
+        description: File Go reads its version from (passed to setup-go).
+        type: string
+        default: go.mod
+      shellcheck-paths:
+        description: >
+          Space-separated files/dirs for shellcheck. Empty (default) scans every
+          *.sh / *.bash in the repo; pass an explicit list to narrow.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  # Context: "<caller-job> / go-test". Race-enabled unit tests.
+  go-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+      - run: go test -race ./...
+
+  # Context: "<caller-job> / go-lint". `go vet` today; golangci-lint is the
+  # documented conformance upgrade (see docs/ci.md).
+  go-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+      - run: go vet ./...
+
+  # Context: "<caller-job> / shell-lint". Plain shellcheck for robustness;
+  # Reviewdog wrapping (inline PR annotations) is the documented upgrade.
+  shell-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Run shellcheck
+        env:
+          PATHS: ${{ inputs.shellcheck-paths }}
+        run: |
+          if [ -n "$PATHS" ]; then
+            # Explicit list from the caller. SC2086: word-splitting is intended.
+            # shellcheck disable=SC2086
+            shellcheck $PATHS
+          else
+            # Default: every shell script in the repo.
+            find . -type f \( -name '*.sh' -o -name '*.bash' \) \
+              -not -path './.git/*' -print0 | xargs -0 -r shellcheck
+          fi
