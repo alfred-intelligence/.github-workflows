@@ -14,6 +14,7 @@ alfred-intelligence ecosystem.
 | [`.github/workflows/go-bash-ci.yml`](.github/workflows/go-bash-ci.yml) | Reusable CI (`workflow_call`) for the Go+Bash stack: `go-test`, `go-lint`, `shell-lint`. The single source of truth for the generic gates. |
 | [`.github/workflows/guardrails.yml`](.github/workflows/guardrails.yml) | Reusable pre-publish hygiene gate (secret/identity/local-path scan). |
 | [`docs/ci.md`](docs/ci.md) | The reusable-CI gate contract + canonical required-check contexts for org rulesets. |
+| [`.github/workflows/dependabot-automerge.yml`](.github/workflows/dependabot-automerge.yml) | Reusable (`workflow_call`) Dependabot auto-merge: minor/patch bumps queue `gh pr merge --auto` once required checks are green; majors are left for a human. Policy: `DECISIONS.md` (S-konservoppnaren). |
 
 ## Quick start
 
