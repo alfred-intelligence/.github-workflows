@@ -79,9 +79,17 @@ definition of what `go-test`/`go-lint`/`shell-lint` mean.
 | mnab branch | Release channel | Gates | Cadence |
 |---|---|---|---|
 | `after` | `dark` | conventional-commits + build only | push (PR gate) + fully-automatic nightly 00:00 UTC cron, skip-if-unchanged |
-| `next` | `light` | conventional-commits + go-test + go-lint | on push/PR |
+| `next` | `light` | conventional-commits + full go-bash-ci battery* | on push/PR |
 | `main` | `stable` | conventional-commits + full battery (go-test, go-lint, shell-lint) | on push/PR |
 | `before` | `patch` | conventional-commits + full battery | on push/PR |
+
+\* Verified live (workflows PR#5 / shy PR#27): `light-gates` and
+`full-gauntlet` both currently call `go-bash-ci.yml` in full — it has no
+input to shed `shell-lint`, so light does not yet get a lighter battery
+than stable despite being named separately for that purpose. Closing that
+gap needs a subsetting input added to `go-bash-ci.yml` itself (shared
+contract, out of Phase 1 scope) — tracked as follow-up, not silently
+inconsistent with this table.
 
 **Conventional commits is the one gate present on every channel, including
 dark.** It's a form gate, not a quality gate: release-please / semver bump /
