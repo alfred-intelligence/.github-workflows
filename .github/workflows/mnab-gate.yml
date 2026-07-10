@@ -208,9 +208,15 @@ jobs:
   # (go-test, go-lint) without the full battery yet — shell-lint and any
   # future security/coverage gates stay reserved for stable so the next/light
   # integration branch isn't paying the full toll on every push.
+  #
+  # Pinned to a full commit SHA, not a branch ref like "@main" — two
+  # independent reasons: (1) this repo's own supply-chain-drift convention,
+  # and (2) short filename.ext@shortref strings get silently mangled by an
+  # upstream content filter that misreads them as an email address and
+  # replaces the whole token — do not "clean this up" to @main.
   light-gates:
     if: inputs.channel == 'light'
-    uses: alfred-intelligence/.github-workflows/.github/workflows/[email protected]
+    uses: alfred-intelligence/.github-workflows/.github/workflows/go-bash-ci.yml@854faf25fdc8cd1bd10bbd5030abd40a6486040c
     with:
       go-version-file: ${{ inputs.go-version-file }}
       shellcheck-paths: ${{ inputs.shellcheck-paths }}
@@ -220,7 +226,7 @@ jobs:
   # actually paid, per the mnab decision.
   full-gauntlet:
     if: inputs.channel == 'stable' || inputs.channel == 'patch'
-    uses: alfred-intelligence/.github-workflows/.github/workflows/[email protected]
+    uses: alfred-intelligence/.github-workflows/.github/workflows/go-bash-ci.yml@854faf25fdc8cd1bd10bbd5030abd40a6486040c
     with:
       go-version-file: ${{ inputs.go-version-file }}
       shellcheck-paths: ${{ inputs.shellcheck-paths }}

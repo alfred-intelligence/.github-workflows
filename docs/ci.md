@@ -42,7 +42,7 @@ on:
 
 jobs:
   ci:
-    uses: alfred-intelligence/.github-workflows/.github/workflows/[email protected]
+    uses: alfred-intelligence/.github-workflows/.github/workflows/go-bash-ci.yml@854faf25fdc8cd1bd10bbd5030abd40a6486040c
     with:
       # Optional. Empty default scans every *.sh/*.bash in the repo.
       shellcheck-paths: "install.sh init/init.bash"
@@ -128,7 +128,7 @@ jobs:
 
   gate:
     needs: channel
-    uses: alfred-intelligence/.github-workflows/.github/workflows/[email protected]
+    uses: alfred-intelligence/.github-workflows/.github/workflows/mnab-gate.yml@<pin-to-real-sha-once-workflows-PR5-merges>
     with:
       channel: ${{ needs.channel.outputs.channel }}
       shellcheck-paths: "install.sh init/init.bash"
@@ -147,7 +147,7 @@ permissions:
 
 jobs:
   gate:
-    uses: alfred-intelligence/.github-workflows/.github/workflows/[email protected]
+    uses: alfred-intelligence/.github-workflows/.github/workflows/mnab-gate.yml@<pin-to-real-sha-once-workflows-PR5-merges>
     with:
       channel: dark
       nightly-dark: true
