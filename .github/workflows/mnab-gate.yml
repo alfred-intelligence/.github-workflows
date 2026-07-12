@@ -1,0 +1,252 @@
+name: mnab-gate
+
+# Reusable CI-gate-gradient for the mnab branch/release model
+# (before/main/next/after -> patch/stable/light/dark).
+#
+# WHY THIS EXISTS: DECISIONS.md "CI-grind-konvention (mnab-modellen)" (2026-07-09,
+# org-binding) says gate intensity ramps TOWARD stable — the experimental edge
+# (after/dark) pays near-zero gate cost so bleeding-edge work isn't choked, while
+# main/stable carries the full battery. Without one shared definition, every repo
+# would hand-roll its own branch->gate mapping and re-drift exactly like
+# go-bash-ci.yml was built to stop happening for job-name/required-check drift.
+# This workflow is the single source of truth for the *gradient itself* (which
+# gates run per channel). It composes go-bash-ci.yml for the actual gate bodies
+# rather than re-implementing them — one definition of "what a gate does", one
+# definition of "which gates apply where".
+#
+# Channels (see docs/ci.md#mnab-gate-gradient for the full contract):
+#   dark   (after)  - conventional-commits + "does it build", nothing else.
+#                      Fully automatic nightly (00:00) publish when after has
+#                      new commits since the last dark build; no operator gate.
+#   light  (next)   - conventional-commits + go-test + go-lint (pre-stable /
+#                      canary correctness, not the full battery yet).
+#   stable (main)   - conventional-commits + the FULL go-bash-ci battery
+#                      (go-test, go-lint, shell-lint).
+#   patch  (before) - same full battery as stable (backport line; repo-specific
+#                      extras like acceptance/perf-bench stay local per
+#                      go-bash-ci.yml's existing scope split).
+#
+# The ONE gate present in every channel, including dark, is conventional
+# commits: a FORM gate (not a quality gate) because release-please / semver /
+# channel promotion all key off commit-header shape. See the conventional-
+# commits job below.
+#
+# Size-tiering seam: `build-command` lets a lean, non-Go repo swap the dark
+# "does it build" check for something else (e.g. `bash -n` or a lint-only
+# command) without needing a second reusable workflow. Phase 1 only proves the
+# Go+Bash (full-mnab) path; the lean main-only path is deliberately not built
+# out further here — this input is the seam, not the full lean contract.
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        description: mnab channel for this run — one of dark, light, stable, patch.
+        type: string
+        required: true
+      go-version-file:
+        description: File Go reads its version from (passed to setup-go / go-bash-ci).
+        type: string
+        default: go.mod
+      shellcheck-paths:
+        description: Space-separated files/dirs for shellcheck (passed to go-bash-ci).
+        type: string
+        default: ""
+      build-command:
+        description: >
+          Command that proves "it builds" for the dark channel. Defaults to the
+          Go build shy/full-mnab repos use; override for non-Go callers (the
+          lean-repo seam).
+        type: string
+        default: go build ./...
+      nightly-dark:
+        description: >
+          Set true only by the caller's scheduled/workflow_dispatch trigger for
+          the 00:00 dark publish run. Turns on skip-if-unchanged + release
+          tagging on top of the normal dark build check.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Context: "<caller-job> / conventional-commits". The one gate present on
+  # every channel. Form gate, not a quality gate: it exists because release
+  # automation (semver bump, changelog, channel promotion) parses the commit
+  # header. Checks every commit introduced by this push/PR, not just HEAD, so
+  # a squash-merge can't hide one bad header among several commits.
+  conventional-commits:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check commit headers are conventional-commits shaped
+        shell: bash
+        env:
+          # All context values consumed as env vars, never interpolated
+          # directly into the script body — SHAs/event-name are low-risk
+          # (hex / fixed enum) but this keeps the pattern uniform and audit-
+          # able per org actions-hardening posture.
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Conventional Commits header grammar (types kept to the org's
+          # actually-used set from git-workflow.md: feat/fix/refactor/docs/
+          # test/chore/perf/ci, plus build/style/revert for tooling commits
+          # and merge commits GitHub itself generates).
+          pattern='^(feat|fix|refactor|docs|test|chore|perf|ci|build|style|revert|Merge)(\(.+\))?!?: .+'
+
+          # Determine the commit range to check.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            range="${PR_BASE_SHA}..${PR_HEAD_SHA}"
+          else
+            # First push to a new branch (or force-push with no 'before')
+            # has an all-zero before SHA; fall back to just HEAD.
+            if [ -z "$PUSH_BEFORE_SHA" ] || [[ "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
+              range="${PUSH_HEAD_SHA}~1..${PUSH_HEAD_SHA}"
+            else
+              range="${PUSH_BEFORE_SHA}..${PUSH_HEAD_SHA}"
+            fi
+          fi
+
+          fail=0
+          while IFS= read -r line; do
+            sha="${line%% *}"
+            subject="${line#* }"
+            # Merge commits (GitHub's own "Merge pull request #N ..." /
+            # "Merge branch ..." headers) are exempt — they're generated, not
+            # authored, and the mnab post-release-sync / release-please flows
+            # rely on plain fast-forward or GitHub-generated merge headers.
+            if [[ "$subject" =~ ^Merge\  ]]; then
+              continue
+            fi
+            if [[ ! "$subject" =~ $pattern ]]; then
+              echo "::error::commit $sha has a non-conventional header: \"$subject\""
+              fail=1
+            fi
+          done < <(git log --format='%H %s' "$range")
+
+          if [ "$fail" -ne 0 ]; then
+            echo "One or more commits do not match conventional-commits shape (type(scope)!: subject)." >&2
+            exit 1
+          fi
+          echo "All commit headers in $range are conventional-commits shaped."
+
+  # Context: "<caller-job> / dark-build". Only meaningful on the dark channel:
+  # "does it build" and nothing else. When nightly-dark=true this also skips
+  # the run entirely if `after` has no new commits since the last dark tag,
+  # and on success tags+publishes a vX.Y.Z-dark.<YYYYMMDD>[+shortsha] release.
+  dark-build:
+    if: inputs.channel == 'dark'
+    runs-on: ubuntu-latest
+    outputs:
+      skipped: ${{ steps.since-last.outputs.skipped || 'false' }}
+      dark-tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Skip if unchanged since last dark build
+        id: since-last
+        if: inputs.nightly-dark
+        shell: bash
+        run: |
+          set -euo pipefail
+          last_dark=$(git tag --list 'v*-dark.*' --sort=-creatordate | head -n1 || true)
+          if [ -z "$last_dark" ]; then
+            echo "No prior dark tag — building."
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          last_sha=$(git rev-list -n1 "$last_dark")
+          head_sha=$(git rev-parse HEAD)
+          if [ "$last_sha" = "$head_sha" ]; then
+            echo "No new commits on after since $last_dark ($last_sha) — skipping nightly build."
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "New commits since $last_dark — building."
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-go@v5
+        if: steps.since-last.outputs.skipped != 'true'
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+
+      - name: Build (the only quality bar on dark)
+        if: steps.since-last.outputs.skipped != 'true'
+        shell: bash
+        env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: |
+          set -euo pipefail
+          case "$BUILD_COMMAND" in
+            "go build ./..."|"bash -n .github/workflows/*.yml"|"make build")
+              ;;
+            *)
+              echo "Unsupported build-command: $BUILD_COMMAND" >&2
+              echo "Allowed values: 'go build ./...', 'bash -n .github/workflows/*.yml', 'make build'" >&2
+              exit 1
+              ;;
+          esac
+          bash -eo pipefail -c "$BUILD_COMMAND"
+
+      - name: Compute dark release tag
+        id: tag
+        if: inputs.nightly-dark && steps.since-last.outputs.skipped != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Base version: latest stable tag (vX.Y.Z) with patch left as-is —
+          # dark is a pre-release label on top of it, not a version bump of
+          # its own. Falls back to v0.0.0 if the repo has no stable tag yet.
+          base=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -Ev -- '-' | head -n1 || true)
+          base="${base:-v0.0.0}"
+          date_stamp=$(date -u +%Y%m%d)
+          short_sha=$(git rev-parse --short HEAD)
+          tag="${base}-dark.${date_stamp}+${short_sha}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Computed dark release tag: $tag"
+
+  # Context: "<caller-job> / light-gates". CORRECTED FROM THE ORIGINAL INTENT:
+  # go-bash-ci.yml runs go-test+go-lint+shell-lint unconditionally with no
+  # subsetting input, so light-gates and full-gauntlet call it identically
+  # today — light does NOT yet shed shell-lint the way the mnab decision's
+  # prose gradient implies. Verified live on shy (workflows PR#5 / shy
+  # PR#27): all three go-bash-ci jobs ran on a light-channel PR. Kept as a
+  # separately-named job (not merged into full-gauntlet) so a real subset
+  # is a small, contained change later — needs a "skip shell-lint" style
+  # input added to go-bash-ci.yml itself, deliberately not done in this
+  # pass (that's a shared-contract change with wider blast radius than
+  # Phase 1's scope). Tracked as follow-up, not silently left inconsistent.
+  #
+  # Pinned to a full commit SHA, not a branch ref like "@main" — two
+  # independent reasons: (1) this repo's own supply-chain-drift convention,
+  # and (2) short filename.ext@shortref strings get silently mangled by an
+  # upstream content filter that misreads them as an email address and
+  # replaces the whole token — do not "clean this up" to @main.
+  light-gates:
+    if: inputs.channel == 'light'
+    uses: alfred-intelligence/.github-workflows/.github/workflows/go-bash-ci.yml@854faf25fdc8cd1bd10bbd5030abd40a6486040c
+    with:
+      go-version-file: ${{ inputs.go-version-file }}
+      shellcheck-paths: ${{ inputs.shellcheck-paths }}
+
+  # Context: "<caller-job> / full-gauntlet". stable (main) and patch (before)
+  # both carry the entire go-bash-ci battery — this is where the gate cost is
+  # actually paid, per the mnab decision.
+  full-gauntlet:
+    if: inputs.channel == 'stable' || inputs.channel == 'patch'
+    uses: alfred-intelligence/.github-workflows/.github/workflows/go-bash-ci.yml@854faf25fdc8cd1bd10bbd5030abd40a6486040c
+    with:
+      go-version-file: ${{ inputs.go-version-file }}
+      shellcheck-paths: ${{ inputs.shellcheck-paths }}

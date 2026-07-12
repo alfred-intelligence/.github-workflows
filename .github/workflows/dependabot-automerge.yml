@@ -41,9 +41,11 @@ on:
       merge-token:
         required: true
 
-permissions:
-  contents: write
-  pull-requests: write
+# No workflow-level permissions block: each job below declares only what it
+# needs (SonarCloud Security Rating gate — least-privilege per job, not a
+# blanket grant every job in the file inherits whether it needs it or not).
+# Neither job actually touches the default GITHUB_TOKEN either way (both use
+# secrets.merge-token explicitly) — this is defense-in-depth, not load-bearing.
 
 jobs:
   # Context: "<caller-job> / evaluate". Reads Dependabot's structured PR
@@ -51,12 +53,14 @@ jobs:
   evaluate:
     if: github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
     outputs:
       update-type: ${{ steps.metadata.outputs.update-type }}
     steps:
       - name: Fetch Dependabot metadata
         id: metadata
-        uses: dependabot/fetch-metadata@v2
+        uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a # v2.5.0
         with:
           github-token: ${{ secrets.merge-token }}
 
@@ -68,6 +72,9 @@ jobs:
       needs.evaluate.outputs.update-type == 'version-update:semver-patch' ||
       needs.evaluate.outputs.update-type == 'version-update:semver-minor'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - name: Enable auto-merge for minor/patch Dependabot PR
         env:
