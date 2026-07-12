@@ -185,7 +185,20 @@ jobs:
       - name: Build (the only quality bar on dark)
         if: steps.since-last.outputs.skipped != 'true'
         shell: bash
-        run: ${{ inputs.build-command }}
+        env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: |
+          set -euo pipefail
+          case "$BUILD_COMMAND" in
+            "go build ./..."|"bash -n .github/workflows/*.yml"|"make build")
+              ;;
+            *)
+              echo "Unsupported build-command: $BUILD_COMMAND" >&2
+              echo "Allowed values: 'go build ./...', 'bash -n .github/workflows/*.yml', 'make build'" >&2
+              exit 1
+              ;;
+          esac
+          bash -eo pipefail -c "$BUILD_COMMAND"
 
       - name: Compute dark release tag
         id: tag
