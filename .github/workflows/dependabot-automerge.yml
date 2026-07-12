@@ -1,0 +1,84 @@
+name: dependabot-automerge
+
+# Reusable "open the tin" gate for Dependabot PRs.
+#
+# WHY THIS EXISTS: the operator decided (S-konservoppnaren, 2026-07-02) that
+# fleet, not the operator, opens Dependabot's cans. This workflow is the single
+# source of truth for that policy's *mechanics* — the policy's *words* live in
+# alfred-intelligence/.github-private/DECISIONS.md. Consumer repos call this
+# instead of hand-rolling their own auto-merge logic, so the semver rule and
+# the merge behaviour cannot drift apart per repo (same one-source-of-truth
+# discipline as go-bash-ci.yml / docs/ci.md).
+#
+# WHAT IT DOES: reads Dependabot's own PR metadata (update-type, dependency
+# names) via the official dependabot/fetch-metadata action — no guessing from
+# the PR title. minor/patch bumps get `gh pr merge --auto`, which only takes
+# effect once the repo's own required checks go green; GitHub does the actual
+# waiting. Major bumps are left untouched for a human (or a future briefing
+# digest) to triage. This workflow never approves reviews and never bypasses
+# branch protection / org rulesets — it only queues a merge that protection
+# would allow anyway.
+#
+# WHAT IT DOES NOT DO: it does not enable auto-merge on the repo (that's a
+# one-time `gh repo edit --enable-auto-merge`, a repo-admin action, done once
+# per repo outside this workflow) and it does not touch security-flagged
+# majors — those still need a human per policy.
+
+on:
+  workflow_call:
+    inputs:
+      merge-method:
+        description: >
+          Merge strategy passed to `gh pr merge --auto`. Match the consumer
+          repo's stated convention (e.g. rebase-only repos like shy/shybook
+          must NOT squash).
+        type: string
+        default: rebase
+    secrets:
+      # A token with repo write is required to approve + queue the merge.
+      # Consumer repos pass their fleet identity's token (bot first, redhat
+      # fallback) — this workflow never assumes a specific identity.
+      merge-token:
+        required: true
+
+# No workflow-level permissions block: each job below declares only what it
+# needs (SonarCloud Security Rating gate — least-privilege per job, not a
+# blanket grant every job in the file inherits whether it needs it or not).
+# Neither job actually touches the default GITHUB_TOKEN either way (both use
+# secrets.merge-token explicitly) — this is defense-in-depth, not load-bearing.
+
+jobs:
+  # Context: "<caller-job> / evaluate". Reads Dependabot's structured PR
+  # metadata (not the title string) to decide the semver level.
+  evaluate:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      update-type: ${{ steps.metadata.outputs.update-type }}
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a # v2.5.0
+        with:
+          github-token: ${{ secrets.merge-token }}
+
+  # Context: "<caller-job> / automerge". Only fires for minor/patch; majors
+  # fall through untouched (mergeStateStatus stays as GitHub computed it).
+  automerge:
+    needs: evaluate
+    if: |
+      needs.evaluate.outputs.update-type == 'version-update:semver-patch' ||
+      needs.evaluate.outputs.update-type == 'version-update:semver-minor'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Enable auto-merge for minor/patch Dependabot PR
+        env:
+          GH_TOKEN: ${{ secrets.merge-token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          MERGE_METHOD: ${{ inputs.merge-method }}
+        run: gh pr merge --auto --"$MERGE_METHOD" "$PR_URL"
