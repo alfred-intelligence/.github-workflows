@@ -1,0 +1,107 @@
+name: dead-branch-sweep
+
+# Central, org-wide dead-branch sweeper. Lives here (not as a per-repo
+# workflow_call reusable) because "dead branches across the org" is a single
+# cross-repo job, not something each consumer repo needs to opt into
+# separately — same shape as register-skill.yml.
+#
+# SAFETY MODEL (see scripts/dead-branch-sweep.sh for the full contract):
+#   - Only ever DELETES branches that are fully MERGED (checked two ways —
+#     commit-containment AND merged-PR history, so squash/rebase merges are
+#     still recognised as merged).
+#   - NEVER touches the default branch, the mnab set (main/next/before/
+#     after), anything GitHub itself reports as protected, or any branch
+#     with an open PR.
+#   - Unmerged + stale (no open PR, no activity > stale_days) branches are
+#     REPORT-ONLY in the job summary + JSON artifact — never deleted. That
+#     silence-plus-no-PR signal is exactly the "stalled but maybe real work"
+#     case the legibility doctrine says to surface, not erase.
+#   - Defaults to dry-run. The scheduled (cron) run only arms (actually
+#     deletes) if the repo variable BRANCH_SWEEP_ARMED is literally "true" —
+#     an explicit, separate, operator-controlled step outside this PR. A
+#     manual workflow_dispatch run defaults its own dry_run input to true as
+#     well, so nothing deletes anything until someone deliberately says so
+#     twice over (once to arm the schedule, once per manual run if used).
+#
+# SCOPE NOTE: this reaches only repos the BRANCH_SWEEP_TOKEN can see — i.e.
+# alfred-intelligence-owned repos reachable by the fleet identity that owns
+# the token. It is not an org-universal or cross-owner sweep; GeGGe01/
+# SAVANTERNA/kebab-it-owned repos are out of scope by construction (see
+# docs/branch-sweep.md).
+
+on:
+  schedule:
+    # Weekly, off-peak, off-the-hour: Sunday 03:17 UTC.
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run — report what WOULD be deleted without deleting."
+        required: true
+        default: true
+        type: boolean
+      stale_days:
+        description: "Days of inactivity before an unmerged branch is reported (never deleted)."
+        required: false
+        default: "90"
+        type: string
+      repos_override:
+        description: "Optional comma-separated owner/repo list. Empty = enumerate the whole org."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read # only for checking out this repo's own script
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify configuration
+        env:
+          SWEEP_TOKEN_SET: ${{ secrets.BRANCH_SWEEP_TOKEN != '' }}
+        run: |
+          if [[ "$SWEEP_TOKEN_SET" != "true" ]]; then
+            echo "::error::missing secret BRANCH_SWEEP_TOKEN — see docs/branch-sweep.md"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Resolve dry-run mode
+        id: mode
+        env:
+          ARMED_VAR: ${{ vars.BRANCH_SWEEP_ARMED }}
+          IS_SCHEDULE: ${{ github.event_name == 'schedule' }}
+          DISPATCH_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          # Schedule runs are dry-run unless the operator has explicitly set
+          # the BRANCH_SWEEP_ARMED repo/org variable to "true". Manual
+          # dispatch runs use the input as-is (itself defaulting to true).
+          if [[ "$IS_SCHEDULE" == "true" ]]; then
+            if [[ "$ARMED_VAR" == "true" ]]; then
+              echo "dry_run=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "dry_run=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "dry_run=${DISPATCH_DRY_RUN}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sweep
+        env:
+          GH_TOKEN: ${{ secrets.BRANCH_SWEEP_TOKEN }}
+          ORG: alfred-intelligence
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
+          STALE_DAYS: ${{ inputs.stale_days || '90' }}
+          REPOS_OVERRIDE: ${{ inputs.repos_override || '' }}
+          OUTPUT_JSON: ${{ runner.temp }}/sweep-summary.json
+        run: bash scripts/dead-branch-sweep.sh | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload JSON summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: dead-branch-sweep-summary
+          path: ${{ runner.temp }}/sweep-summary.json
+          retention-days: 90

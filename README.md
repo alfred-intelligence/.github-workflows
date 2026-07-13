@@ -17,6 +17,9 @@ alfred-intelligence ecosystem.
 | [`.github/workflows/dependabot-automerge.yml`](.github/workflows/dependabot-automerge.yml) | Reusable (`workflow_call`) Dependabot auto-merge: minor/patch bumps queue `gh pr merge --auto` once required checks are green; majors are left for a human. Policy: `DECISIONS.md` (S-konservoppnaren). |
 | [`scripts/gh-app-installation-token.sh`](scripts/gh-app-installation-token.sh) | Mint a GitHub App installation token outside a workflow (local agent use, e.g. Governator's org-ruleset sweep). |
 | [`docs/aifred-governance-app.md`](docs/aifred-governance-app.md) | The read-only `aifred-governance` App: permissions, credential location, how to invoke the mint script. |
+| [`.github/workflows/dead-branch-sweep.yml`](.github/workflows/dead-branch-sweep.yml) | Central, org-wide sweep that deletes only fully-merged branches; reports (never deletes) stale unmerged ones. Dry-run by default. |
+| [`scripts/dead-branch-sweep.sh`](scripts/dead-branch-sweep.sh) | The sweep logic, callable standalone for local testing. |
+| [`docs/branch-sweep.md`](docs/branch-sweep.md) | Safety guarantees, token scope, arming procedure for the dead-branch sweep. |
 
 ## Quick start
 
