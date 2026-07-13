@@ -13,9 +13,24 @@
 #     alone is reliable:
 #       (a) commit-containment via `compare base...head` (status identical
 #           or behind) — catches merge-commit and fast-forward merges.
-#       (b) a closed PR for that branch head with merged_at set — catches
+#       (b) a closed PR for that branch head with merged_at set AND
+#           head.sha == the branch's CURRENT tip commit — catches
 #           squash/rebase merges, where (a) alone would say "diverged"
-#           even though the PR genuinely merged.
+#           even though the PR genuinely merged. The head.sha match is
+#           load-bearing: GitHub keeps closed-PR records forever, so a
+#           branch NAME that gets reused (force-pushed with new unmerged
+#           commits after its old PR merged, or deleted+recreated) would
+#           otherwise still show a "merged" PR for that name even though
+#           the branch's current content was never merged. Requiring the
+#           merged PR's head.sha to equal the live branch tip means a
+#           stale record for a reused name can't fire the OR.
+#   - Branch names can legally contain `&`, `=`, `#` (git ref rules forbid
+#     space/`..`/`~`/`^`/`:`/`?`/`*`/`[`/`\`, but not those) — every branch
+#     name that reaches a GitHub API call is percent-encoded first, and the
+#     PR-history query uses `gh api -f`/`-f` (which encodes for us) rather
+#     than hand-spliced query-string interpolation, so a branch named e.g.
+#     `x&head=owner:other-branch` can't inject a second `head=` param and
+#     read a different branch's PR history.
 #   - NEVER deletes: the default branch, any name in PROTECTED_BRANCHES
 #     (main/next/before/after — the mnab set — by default), any branch
 #     GitHub itself reports as protected (covers release branches and
@@ -64,6 +79,14 @@ done
 
 log() { printf '%s\n' "$*" >&2; }
 
+# Percent-encode a single path segment (branch names can contain characters
+# that are structurally meaningful in a URL — '&', '=', '#' — even though
+# git ref rules forbid the classic shell-hostile set). Used for every branch
+# name spliced into a REST path. jq's @uri is RFC 3986 percent-encoding.
+urlencode() {
+  jq -rn --arg s "$1" '$s | @uri'
+}
+
 is_protected_name() {
   local branch="$1" name
   IFS=',' read -ra names <<<"$PROTECTED_BRANCHES"
@@ -101,29 +124,49 @@ for repo in "${repos[@]}"; do
     [[ "$branch" == "$default_branch" ]] && continue
     is_protected_name "$branch" && continue
 
-    protected=$(gh api "repos/${repo}/branches/${branch}" -q '.protected')
+    encoded_branch=$(urlencode "$branch")
+
+    # One branches/<name> fetch serves both the protected flag and the
+    # current tip SHA / last-commit date used below — avoids a second
+    # identical call and gives FIX 1 (see below) the live tip to compare
+    # against before the branches/<name> call happens a second time.
+    branch_info=$(gh api "repos/${repo}/branches/${encoded_branch}")
+    protected=$(jq -r '.protected' <<<"$branch_info")
     [[ "$protected" == "true" ]] && continue
 
-    prs_json=$(gh api "repos/${repo}/pulls?head=${owner}:${branch}&state=all" 2>/dev/null || echo '[]')
+    current_sha=$(jq -r '.commit.sha' <<<"$branch_info")
+    last_commit_date=$(jq -r '.commit.commit.committer.date' <<<"$branch_info")
+
+    # gh api -f/-f builds the query string itself (percent-encodes each
+    # value), so a branch name containing '&'/'='/'#' can't splice in an
+    # extra query param and redirect this lookup at a different branch's
+    # PR history.
+    prs_json=$(gh api -f head="${owner}:${branch}" -f state=all "repos/${repo}/pulls" 2>/dev/null || echo '[]')
 
     has_open_pr=$(jq -r 'any(.[]; .state == "open")' <<<"$prs_json")
     [[ "$has_open_pr" == "true" ]] && continue
 
-    has_merged_pr=$(jq -r 'any(.[]; .merged_at != null)' <<<"$prs_json")
+    # A closed PR's merged_at record is only trusted when its head.sha
+    # matches the branch's CURRENT tip. Without this, a reused branch name
+    # (force-pushed with new unmerged commits after an earlier merge, or
+    # deleted+recreated) would still read as "merged" off the stale PR
+    # record even though compare correctly reports diverged — this is the
+    # data-loss path this check exists to close. A genuine squash/rebase
+    # merge of the branch's current tip still matches, since the tip hasn't
+    # moved since GitHub recorded the merge.
+    has_merged_pr=$(jq -r --arg sha "$current_sha" \
+      'any(.[]; .merged_at != null and .head.sha == $sha)' <<<"$prs_json")
 
-    compare_status=$(gh api "repos/${repo}/compare/${default_branch}...${branch}" -q '.status' 2>/dev/null || echo "unknown")
+    compare_status=$(gh api "repos/${repo}/compare/$(urlencode "$default_branch")...${encoded_branch}" -q '.status' 2>/dev/null || echo "unknown")
     merged_by_commits="false"
     [[ "$compare_status" == "identical" || "$compare_status" == "behind" ]] && merged_by_commits="true"
-
-    branch_info=$(gh api "repos/${repo}/branches/${branch}")
-    last_commit_date=$(jq -r '.commit.commit.committer.date' <<<"$branch_info")
 
     if [[ "$merged_by_commits" == "true" || "$has_merged_pr" == "true" ]]; then
       if [[ "$DRY_RUN" == "true" ]]; then
         action="would-delete"
       else
         action="deleted"
-        gh api -X DELETE "repos/${repo}/git/refs/heads/${branch}"
+        gh api -X DELETE "repos/${repo}/git/refs/heads/${encoded_branch}"
       fi
       log "  $action: $branch (merged, last commit $last_commit_date)"
       deleted_rows+=("$(jq -nc --arg repo "$repo" --arg branch "$branch" --arg action "$action" \
