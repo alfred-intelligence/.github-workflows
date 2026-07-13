@@ -28,6 +28,18 @@ name: dead-branch-sweep
 # the token. It is not an org-universal or cross-owner sweep; GeGGe01/
 # SAVANTERNA/kebab-it-owned repos are out of scope by construction (see
 # docs/branch-sweep.md).
+#
+# ACTION PINNING NOTE: this repo's established convention (72f78e9) leaves
+# GitHub-owned actions (actions/checkout et al) on floating major tags —
+# only third-party actions get SHA-pinned — because CodeQL's unpinned-tag
+# query itself trusts first-party actions/* actions. This workflow is a
+# deliberate exception: actions/checkout and actions/upload-artifact are
+# SHA-pinned here even though they're first-party, because the Sweep step
+# runs with BRANCH_SWEEP_TOKEN (an org-wide contents:write PAT) in the same
+# job — a floating tag on a step that shares a job with that token is a
+# bigger blast radius than the convention was written for. Bump the SHA
+# deliberately (not by just re-adding @v4) when a new checkout/upload-
+# artifact major version is needed.
 
 on:
   schedule:
@@ -67,7 +79,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Resolve dry-run mode
         id: mode
@@ -100,7 +112,7 @@ jobs:
         run: bash scripts/dead-branch-sweep.sh | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload JSON summary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dead-branch-sweep-summary
           path: ${{ runner.temp }}/sweep-summary.json

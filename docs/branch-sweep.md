@@ -13,9 +13,17 @@ something each consumer repo opts into separately.
   1. Commit-containment: `compare <default>...<branch>` reports `identical`
      or `behind` — the branch has no commits the default branch lacks.
   2. Merged-PR history: a closed PR exists for that branch head with
-     `merged_at` set — this is what catches **squash and rebase merges**,
-     which (1) alone would miss because the base branch gets a *new* commit
-     SHA, not the branch's original commits.
+     `merged_at` set **and** that PR's `head.sha` equals the branch's
+     *current* tip commit — this is what catches **squash and rebase
+     merges**, which (1) alone would miss because the base branch gets a
+     *new* commit SHA, not the branch's original commits. The head-SHA match
+     is load-bearing, not decorative: GitHub keeps closed-PR records
+     forever, so without it a *reused* branch name (force-pushed with new,
+     genuinely-unmerged commits after an earlier PR on that name merged, or
+     deleted and recreated) would still read as merged off the stale PR
+     record even though commit-containment correctly says diverged — that
+     was a real data-loss bug (security review, pre-merge) fixed before this
+     PR shipped.
 - **Never deletes:** the repo's own default branch, the mnab set
   (`main`, `next`, `before`, `after`) by name, any branch GitHub's API
   itself reports as `protected` (covers release branches and anything
@@ -101,6 +109,17 @@ something a workflow silently decides for itself. **This PR does not add
 that entry** — it ships the mechanism inert (dry-run) and flags that the
 operator/governance-owner should add a short `DECISIONS.md` post before
 `BRANCH_SWEEP_ARMED` is ever set to `true` anywhere.
+
+**Second gate, not just the first:** the `DECISIONS.md` entry authorizing
+org-wide auto-delete is not the *only* precondition for arming. It must ALSO
+confirm the merged-branch decision in `scripts/dead-branch-sweep.sh` still
+requires a merged PR's `head.sha` to match the branch's current tip (the
+fix described above) before `BRANCH_SWEEP_ARMED` is set anywhere — a future
+edit to that script that drops the SHA-match check (e.g. "simplify" back to
+`any(.[]; .merged_at != null)`) reopens the reused-branch-name data-loss
+path even with a clean DECISIONS.md authorization in place. Whoever reviews
+the arming request should diff the live script against this contract, not
+just check that a governance entry exists.
 
 ## Local testing
 
