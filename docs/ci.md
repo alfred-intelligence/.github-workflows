@@ -189,6 +189,101 @@ without `contents: write` permission wired up doesn't silently fail.
 - Action pinning: pin `actions/*` to commit SHAs to match this repo's
   actions-hardening posture.
 
+## Sonar rating gate (`sonar-rating-gate.yml`)
+
+Per operator directive (2026-07-16, `dante-ops/docs/sonar-rating-gate-per-branch.md`,
+section "The gate: OVERALL composite, per target branch"): a required check
+that enforces SonarCloud's **overall New-Code composite** (ratings +
+duplication + coverage, worst failing condition governs) for the PR's target
+(base) branch, along the same mnab maturity gradient as the CI gate above —
+maturity increases toward `main`, so the composite bar does too.
+
+| PR base branch | Rating (new code)* | Duplication (new) | Coverage (new) |
+|---|---|---|---|
+| `after`  | ≥ **C** | ≤ 5% | advisory (report, don't block) |
+| `next`   | ≥ **B** | ≤ 3% | ≥ 80% |
+| `main`   | **A**   | ≤ 3% | ≥ 80% |
+| `before` | **A**   | ≤ 3% | ≥ 80% |
+
+\* Worst-of-three across Maintainability (`new_maintainability_rating`),
+Reliability (`new_reliability_rating`), Security (`new_security_rating`).
+`main`/`before` mirror SonarCloud's strict "Sonar way" default profile; `next`
+relaxes ratings to B; `after` relaxes ratings to C and duplication to ≤5%,
+with coverage advisory-only. All thresholds are per-input overrides on the
+reusable workflow — the table is the org-binding default, not hardcoded.
+
+This workflow is **independent of go-bash-ci.yml / mnab-gate.yml** — it reads
+measures from the SonarCloud API, it does not run tests, so it applies to any
+language SonarCloud analyzes, not just the Go+Bash stack.
+
+**Structural no-permanent-block guarantees** (this org's everything-must-work
+posture): a repo with no coverage tool instrumented never gets permanently
+blocked by the coverage axis — an ABSENT `new_coverage` metric is treated as
+"not tracked, not enforceable" (skip + warn), never as a failing 0%. A PR
+with zero New Code (e.g. docs-only) is treated the same as "no analysis yet"
+— see `fail-if-no-analysis` below.
+
+### Prerequisites (per consumer repo)
+
+1. SonarCloud **automatic analysis** already running on the repo (GitHub App,
+   no CI sonar step needed) so PR analyses exist to query.
+2. The repo's exact SonarCloud **project key** (from the SonarCloud project
+   settings — do not guess from the repo name). Confirmed for centralstation:
+   `alfred-intelligence_centralstation`, org `alfred-intelligence` (2026-07-16).
+3. `SONAR_TOKEN` provisioned as an **admin-plane** Actions secret (org or repo
+   level) — the operator/CI-owner does this; agents do not enumerate the
+   secret store looking for it (see `admin-plane-operator-ops-plane-bot`).
+
+### Consuming it
+
+```yaml
+# .github/workflows/sonar-gate.yml in the consumer repo
+name: Sonar rating gate
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  sonar-gate:
+    uses: alfred-intelligence/.github-workflows/.github/workflows/sonar-rating-gate.yml@<pin-to-real-sha-once-merged>
+    with:
+      sonar-project-key: "alfred-intelligence_centralstation"  # confirmed 2026-07-16; other repos: confirm from SonarCloud settings
+      # sonar-org defaults to "alfred-intelligence" already — override only if it ever differs
+    secrets:
+      sonar-token: ${{ secrets.SONAR_TOKEN }}
+```
+
+With a caller job named `sonar-gate`, the required-check context is:
+
+```
+sonar-gate / rating-gate
+```
+
+That is the exact string to add to branch protection / the org ruleset per
+mnab base branch (see the wire-up instructions handed to the operator
+alongside this PR — this workflow never applies branch protection itself).
+
+### Behavior notes
+
+- Runs only on `pull_request` events (reads `github.event.pull_request.*`);
+  wiring it to `push` is a caller misconfiguration, not silently ignored.
+- A PR whose base branch is none of `before`/`main`/`next`/`after` **passes
+  with a warning** by default (`unmapped-base-behavior: skip`) — not every
+  repo runs full mnab yet. Set it to `fail` for repos that want every base
+  branch explicitly mapped.
+- A missing SonarCloud PR analysis, or a PR with no New Code to rate, **blocks
+  by default** (`fail-if-no-analysis: true`, the strict default) — flip to
+  `false` only during a repo's initial rollout window.
+- All three composite axes (ratings, duplication, coverage) are evaluated and
+  reported together in one run — a PR failing on multiple axes (as `#88` did,
+  on both Duplication and Security Rating simultaneously) sees all of them at
+  once, not just the first.
+- Governance anchor: the gradient table above is drafted for
+  `alfred-intelligence/.github-private/DECISIONS.md` — priest drafts, operator
+  lands via PR (same discipline as the mnab CI-grind-gradient decision).
+
 ## Dependabot auto-merge (`dependabot-automerge.yml`)
 
 Separate concern from the CI gate above, same one-source-of-truth discipline.
