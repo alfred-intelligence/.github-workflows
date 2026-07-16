@@ -1,0 +1,413 @@
+name: sonar-rating-gate
+
+# Reusable required-check that gates a PR's merge on SonarCloud's OVERALL
+# COMPOSITE (ratings + duplication + coverage, all on New Code) for the PR's
+# TARGET (base) branch, along the mnab maturity gradient (before/main/next/
+# after). Contract + rationale:
+# dante-ops/docs/sonar-rating-gate-per-branch.md, section "The gate: OVERALL
+# composite, per target branch" (operator decision 2026-07-16).
+#
+# WHY THIS EXISTS: SonarCloud's own PR decoration reports these numbers, but
+# nothing today ENFORCES a floor per branch — a sub-threshold PR can still
+# merge because no required check reads them. A single rating axis is also
+# not enough on its own: the #88 trigger example failed on BOTH "Duplication
+# on New Code" AND "Security Rating on New Code" in the same analysis, so the
+# gate reads a composite per branch, not one letter.
+#
+# Per-branch composite profile (worst FAILING condition governs; New Code
+# metrics only — SonarCloud's new_* measures, which is what PR analysis
+# already scopes to):
+#   after  -> ratings >= C, duplication <= 5%,  coverage ADVISORY (report only)
+#   next   -> ratings >= B, duplication <= 3%,  coverage >= 80%
+#   main   -> ratings A,    duplication <= 3%,  coverage >= 80%
+#   before -> ratings A,    duplication <= 3%,  coverage >= 80%
+# All defaults below are overridable per-input so a repo/PR can tune without
+# editing this shared file, but these are the org-binding defaults from the
+# decision doc.
+#
+# Ratings axis: Maintainability (new_maintainability_rating), Reliability
+# (new_reliability_rating), Security (new_security_rating) — default all
+# three, worst-of-three governs. Narrow via `axes` only on explicit operator
+# direction; duplication and coverage are unconditional (not subsettable).
+#
+# Coverage-not-instrumented handling: if a repo has no coverage tool wired up,
+# SonarCloud simply omits new_coverage from the response. This workflow
+# treats an ABSENT metric as "not tracked, not enforceable" (skip + warn),
+# never as a failing 0% — a repo that has never had coverage should not be
+# permanently blocked by a check it structurally cannot satisfy (see the
+# everything-must-work / no-permanent-BLOCKED doctrine this org runs on).
+# A PRESENT metric that fails the threshold still blocks normally.
+#
+# No-new-code handling: a PR that adds no new lines (e.g. docs-only) can have
+# SonarCloud report an empty measures set entirely. That is treated the same
+# as "no analysis yet" (see fail-if-no-analysis) — nothing new to rate, so it
+# passes rather than blocking on a structurally-empty diff.
+#
+# Requires: a SonarCloud token as a secret (admin-plane provisioned — this
+# workflow never reads/derives it itself, the caller passes it via
+# `secrets.sonar-token`) and the exact SonarCloud `sonar-project-key` (repo-
+# specific, confirmed from the SonarCloud project settings — for
+# centralstation this is `alfred-intelligence_centralstation`, org
+# `alfred-intelligence`, confirmed 2026-07-16).
+#
+# Runs only on pull_request events (it reads github.event.pull_request.*); a
+# caller wiring this on push would no-op with a clear error, not silently
+# pass.
+
+on:
+  workflow_call:
+    inputs:
+      sonar-project-key:
+        description: >
+          Exact SonarCloud project key for this repo (from the SonarCloud
+          project settings — not assumed/guessed). Required; no default.
+        type: string
+        required: true
+      sonar-org:
+        description: SonarCloud organization slug.
+        type: string
+        default: "alfred-intelligence"
+      axes:
+        description: >
+          Comma-separated subset of maintainability,reliability,security
+          rating axes to enforce (worst-of-selected governs). Duplication
+          and coverage are always checked — not subsettable. Default is all
+          three rating axes; narrow only on explicit operator direction.
+        type: string
+        default: "maintainability,reliability,security"
+
+      after-min-rating:
+        description: Minimum New-Code rating (A-E) required when the PR's base branch is 'after'.
+        type: string
+        default: "C"
+      after-max-duplication:
+        description: Maximum New-Code duplicated-lines-density (percent) allowed on base 'after'.
+        type: string
+        default: "5"
+      after-coverage-mode:
+        description: "'advisory' (report, never block) or 'enforce' for base 'after'."
+        type: string
+        default: "advisory"
+      after-min-coverage:
+        description: Minimum New-Code coverage (percent) for base 'after', used only if after-coverage-mode=enforce.
+        type: string
+        default: "80"
+
+      next-min-rating:
+        description: Minimum New-Code rating (A-E) required when the PR's base branch is 'next'.
+        type: string
+        default: "B"
+      next-max-duplication:
+        description: Maximum New-Code duplicated-lines-density (percent) allowed on base 'next'.
+        type: string
+        default: "3"
+      next-coverage-mode:
+        description: "'advisory' or 'enforce' for base 'next'."
+        type: string
+        default: "enforce"
+      next-min-coverage:
+        description: Minimum New-Code coverage (percent) for base 'next'.
+        type: string
+        default: "80"
+
+      main-min-rating:
+        description: Minimum New-Code rating (A-E) required when the PR's base branch is 'main'.
+        type: string
+        default: "A"
+      main-max-duplication:
+        description: Maximum New-Code duplicated-lines-density (percent) allowed on base 'main'.
+        type: string
+        default: "3"
+      main-coverage-mode:
+        description: "'advisory' or 'enforce' for base 'main'."
+        type: string
+        default: "enforce"
+      main-min-coverage:
+        description: Minimum New-Code coverage (percent) for base 'main'.
+        type: string
+        default: "80"
+
+      before-min-rating:
+        description: Minimum New-Code rating (A-E) required when the PR's base branch is 'before'.
+        type: string
+        default: "A"
+      before-max-duplication:
+        description: Maximum New-Code duplicated-lines-density (percent) allowed on base 'before'.
+        type: string
+        default: "3"
+      before-coverage-mode:
+        description: "'advisory' or 'enforce' for base 'before'."
+        type: string
+        default: "enforce"
+      before-min-coverage:
+        description: Minimum New-Code coverage (percent) for base 'before'.
+        type: string
+        default: "80"
+
+      unmapped-base-behavior:
+        description: >
+          What to do when the PR's base branch is none of before/main/next/
+          after (e.g. a stacked PR onto a feature branch). 'skip' (default)
+          warns and passes — not every repo runs full mnab yet. 'fail' blocks
+          instead, for repos that want every base branch mapped explicitly.
+        type: string
+        default: "skip"
+      fail-if-no-analysis:
+        description: >
+          Whether a missing SonarCloud PR analysis, or a PR with no New Code
+          to rate (e.g. docs-only), blocks the check (true, the strict
+          default) or passes with a warning (false — useful during initial
+          rollout before SonarCloud has analyzed a repo's first PR on a given
+          base).
+        type: boolean
+        default: true
+    secrets:
+      sonar-token:
+        description: >
+          SonarCloud API token. Admin-plane Actions secret — the operator
+          provisions it (see admin-plane-operator-ops-plane-bot); this
+          workflow never scans for or derives it itself.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Context: "<caller-job> / rating-gate".
+  rating-gate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve per-branch composite profile (mnab gradient)
+        id: profile
+        shell: bash
+        env:
+          # Context values consumed as env vars, never interpolated directly
+          # into the script body — matches this repo's actions-hardening
+          # pattern (see mnab-gate.yml's conventional-commits job).
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          UNMAPPED_BEHAVIOR: ${{ inputs.unmapped-base-behavior }}
+          AFTER_MIN_RATING: ${{ inputs.after-min-rating }}
+          AFTER_MAX_DUP: ${{ inputs.after-max-duplication }}
+          AFTER_COV_MODE: ${{ inputs.after-coverage-mode }}
+          AFTER_MIN_COV: ${{ inputs.after-min-coverage }}
+          NEXT_MIN_RATING: ${{ inputs.next-min-rating }}
+          NEXT_MAX_DUP: ${{ inputs.next-max-duplication }}
+          NEXT_COV_MODE: ${{ inputs.next-coverage-mode }}
+          NEXT_MIN_COV: ${{ inputs.next-min-coverage }}
+          MAIN_MIN_RATING: ${{ inputs.main-min-rating }}
+          MAIN_MAX_DUP: ${{ inputs.main-max-duplication }}
+          MAIN_COV_MODE: ${{ inputs.main-coverage-mode }}
+          MAIN_MIN_COV: ${{ inputs.main-min-coverage }}
+          BEFORE_MIN_RATING: ${{ inputs.before-min-rating }}
+          BEFORE_MAX_DUP: ${{ inputs.before-max-duplication }}
+          BEFORE_COV_MODE: ${{ inputs.before-coverage-mode }}
+          BEFORE_MIN_COV: ${{ inputs.before-min-coverage }}
+        run: |
+          set -euo pipefail
+
+          case "$BASE_REF" in
+            after)
+              min_rating="$AFTER_MIN_RATING"; max_dup="$AFTER_MAX_DUP"
+              cov_mode="$AFTER_COV_MODE"; min_cov="$AFTER_MIN_COV"
+              ;;
+            next)
+              min_rating="$NEXT_MIN_RATING"; max_dup="$NEXT_MAX_DUP"
+              cov_mode="$NEXT_COV_MODE"; min_cov="$NEXT_MIN_COV"
+              ;;
+            main)
+              min_rating="$MAIN_MIN_RATING"; max_dup="$MAIN_MAX_DUP"
+              cov_mode="$MAIN_COV_MODE"; min_cov="$MAIN_MIN_COV"
+              ;;
+            before)
+              min_rating="$BEFORE_MIN_RATING"; max_dup="$BEFORE_MAX_DUP"
+              cov_mode="$BEFORE_COV_MODE"; min_cov="$BEFORE_MIN_COV"
+              ;;
+            *)
+              if [ "$UNMAPPED_BEHAVIOR" = "fail" ]; then
+                echo "::error::PR base branch '$BASE_REF' is not one of before/main/next/after and unmapped-base-behavior=fail — no composite profile to enforce, blocking." >&2
+                exit 1
+              fi
+              echo "::warning::PR base branch '$BASE_REF' is not one of before/main/next/after — unmapped-base-behavior=skip, passing without a Sonar check." >&2
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          {
+            echo "skip=false"
+            echo "base_ref=$BASE_REF"
+            echo "min_rating=$min_rating"
+            echo "max_dup=$max_dup"
+            echo "cov_mode=$cov_mode"
+            echo "min_cov=$min_cov"
+          } >> "$GITHUB_OUTPUT"
+          echo "PR base '$BASE_REF' profile: rating>=$min_rating, duplication<=$max_dup%, coverage($cov_mode)>=$min_cov%"
+
+      - name: Query SonarCloud New-Code composite measures
+        id: sonar
+        if: steps.profile.outputs.skip != 'true'
+        shell: bash
+        env:
+          SONAR_TOKEN: ${{ secrets.sonar-token }}
+          PROJECT_KEY: ${{ inputs.sonar-project-key }}
+          SONAR_ORG: ${{ inputs.sonar-org }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          AXES: ${{ inputs.axes }}
+        run: |
+          set -euo pipefail
+
+          # Map our rating-axis names -> SonarCloud New-Code metric keys, plus
+          # the two always-on composite metrics (duplication, coverage).
+          metric_keys="new_duplicated_lines_density,new_coverage"
+          IFS=',' read -ra axis_list <<< "$AXES"
+          for axis in "${axis_list[@]}"; do
+            case "$axis" in
+              maintainability) key="new_maintainability_rating" ;;
+              reliability)     key="new_reliability_rating" ;;
+              security)        key="new_security_rating" ;;
+              *)
+                echo "::error::Unknown axis '$axis' — expected maintainability, reliability, or security." >&2
+                exit 1
+                ;;
+            esac
+            metric_keys="${metric_keys},${key}"
+          done
+
+          url="https://sonarcloud.io/api/measures/component?component=${PROJECT_KEY}&pullRequest=${PR_NUMBER}&metricKeys=${metric_keys}"
+          if [ -n "$SONAR_ORG" ]; then
+            url="${url}&organization=${SONAR_ORG}"
+          fi
+
+          http_code=$(curl -sS -o /tmp/sonar-measures.json -w '%{http_code}' -u "${SONAR_TOKEN}:" "$url")
+
+          if [ "$http_code" != "200" ]; then
+            echo "::warning::SonarCloud API returned HTTP $http_code — treating as no-analysis-yet." >&2
+            cat /tmp/sonar-measures.json >&2 || true
+            echo "no_analysis=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          measure_count=$(jq '.component.measures | length' /tmp/sonar-measures.json)
+          if [ "$measure_count" -eq 0 ]; then
+            echo "::warning::SonarCloud returned HTTP 200 but no measures for PR #${PR_NUMBER} — likely no New Code in this PR (e.g. docs-only) or no analysis yet." >&2
+            echo "no_analysis=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "no_analysis=false" >> "$GITHUB_OUTPUT"
+          cat /tmp/sonar-measures.json
+
+      - name: Evaluate composite against the branch profile
+        if: steps.profile.outputs.skip != 'true'
+        shell: bash
+        env:
+          BASE_REF: ${{ steps.profile.outputs.base_ref }}
+          MIN_RATING: ${{ steps.profile.outputs.min_rating }}
+          MAX_DUP: ${{ steps.profile.outputs.max_dup }}
+          COV_MODE: ${{ steps.profile.outputs.cov_mode }}
+          MIN_COV: ${{ steps.profile.outputs.min_cov }}
+          NO_ANALYSIS: ${{ steps.sonar.outputs.no_analysis }}
+          FAIL_IF_NO_ANALYSIS: ${{ inputs.fail-if-no-analysis }}
+        run: |
+          set -euo pipefail
+
+          if [ "$NO_ANALYSIS" = "true" ]; then
+            if [ "$FAIL_IF_NO_ANALYSIS" = "true" ]; then
+              echo "::error::No SonarCloud PR analysis / New Code to rate, and fail-if-no-analysis=true — blocking." >&2
+              exit 1
+            fi
+            echo "::warning::No SonarCloud PR analysis / New Code to rate; fail-if-no-analysis=false — passing (soft-fail) during rollout." >&2
+            exit 0
+          fi
+
+          # SonarCloud ratings are 1..5 = A..E (higher number = worse).
+          rating_value() {
+            case "$1" in
+              A|a|1|1.0) echo 1 ;;
+              B|b|2|2.0) echo 2 ;;
+              C|c|3|3.0) echo 3 ;;
+              D|d|4|4.0) echo 4 ;;
+              E|e|5|5.0) echo 5 ;;
+              *) echo "0" ;;
+            esac
+          }
+
+          required_num=$(rating_value "$MIN_RATING")
+          if [ "$required_num" -eq 0 ]; then
+            echo "::error::Unrecognized min-rating value '$MIN_RATING' (expected A-E)." >&2
+            exit 1
+          fi
+
+          fail=0
+
+          # --- Ratings: worst-of-selected-axes among new_*_rating metrics ---
+          worst=0
+          worst_metric=""
+          while IFS=$'\t' read -r metric value; do
+            case "$metric" in
+              new_security_rating|new_reliability_rating|new_maintainability_rating) ;;
+              *) continue ;;
+            esac
+            num=$(rating_value "$value")
+            if [ "$num" -eq 0 ]; then
+              echo "::error::Unrecognized rating value '$value' for metric '$metric'." >&2
+              fail=1
+              continue
+            fi
+            if [ "$num" -gt "$worst" ]; then
+              worst=$num
+              worst_metric=$metric
+            fi
+          done < <(jq -r '.component.measures[] | [.metric, .value] | @tsv' /tmp/sonar-measures.json)
+
+          if [ "$worst" -gt 0 ]; then
+            letters="ABCDE"
+            worst_letter="${letters:$((worst - 1)):1}"
+            required_letter="${letters:$((required_num - 1)):1}"
+            if [ "$worst" -gt "$required_num" ]; then
+              echo "::error::Rating axis FAILED — $worst_metric=$worst_letter is worse than required $required_letter for base '$BASE_REF'." >&2
+              fail=1
+            else
+              echo "Rating axis OK — worst is $worst_metric=$worst_letter (<= required $required_letter)."
+            fi
+          else
+            echo "No rating measures present in the response for the selected axes — nothing to enforce on this axis for this PR."
+          fi
+
+          # --- Duplication: new_duplicated_lines_density <= max_dup ---
+          dup_value=$(jq -r '.component.measures[] | select(.metric == "new_duplicated_lines_density") | .value' /tmp/sonar-measures.json)
+          if [ -n "$dup_value" ]; then
+            if awk -v v="$dup_value" -v max="$MAX_DUP" 'BEGIN { exit !(v > max) }'; then
+              echo "::error::Duplication FAILED — new_duplicated_lines_density=${dup_value}% exceeds max ${MAX_DUP}% for base '$BASE_REF'." >&2
+              fail=1
+            else
+              echo "Duplication OK — new_duplicated_lines_density=${dup_value}% (<= ${MAX_DUP}%)."
+            fi
+          else
+            echo "new_duplicated_lines_density not present (no New Code duplication data) — nothing to enforce."
+          fi
+
+          # --- Coverage: new_coverage >= min_cov, unless mode=advisory ---
+          cov_value=$(jq -r '.component.measures[] | select(.metric == "new_coverage") | .value' /tmp/sonar-measures.json)
+          if [ -n "$cov_value" ]; then
+            if awk -v v="$cov_value" -v min="$MIN_COV" 'BEGIN { exit !(v < min) }'; then
+              if [ "$COV_MODE" = "enforce" ]; then
+                echo "::error::Coverage FAILED — new_coverage=${cov_value}% is below required ${MIN_COV}% for base '$BASE_REF'." >&2
+                fail=1
+              else
+                echo "::warning::Coverage advisory — new_coverage=${cov_value}% is below the ${MIN_COV}% target for base '$BASE_REF', but coverage-mode=advisory so this does not block." >&2
+              fi
+            else
+              echo "Coverage OK — new_coverage=${cov_value}% (>= ${MIN_COV}%)."
+            fi
+          else
+            echo "new_coverage not present (repo has no coverage instrumented) — nothing to enforce; this is not treated as a failing 0%."
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Sonar rating gate FAILED for base '$BASE_REF' — see individual axis failures above." >&2
+            exit 1
+          fi
+
+          echo "Sonar rating gate PASSED for base '$BASE_REF'."
